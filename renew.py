@@ -262,6 +262,14 @@ class MochiClient:
         self.refresh_token: str | None = MOCHI_REFRESH_TOKEN or None
         self.id_token: str | None = None
 
+    @property
+    def api_bearer(self) -> str | None:
+        """
+        门户前端 getToken() 实际返回的是 id_token（不是 access_token）。
+        API 校验: Authorization: Bearer <id_token>
+        """
+        return self.id_token or self.access_token
+
     def _set_tokens(self, payload: dict[str, Any]) -> None:
         if payload.get("access_token"):
             self.access_token = payload["access_token"]
@@ -269,9 +277,18 @@ class MochiClient:
             self.refresh_token = payload["refresh_token"]
         if payload.get("id_token"):
             self.id_token = payload["id_token"]
-        log("✅ 已取得 access_token")
-        if self.refresh_token:
-            log(f"ℹ️ refresh_token 就绪 (len={len(self.refresh_token)})")
+
+        # 调试用：只打长度，避免泄露 token
+        log(
+            "✅ token 响应: "
+            f"id_token={len(self.id_token or '')} "
+            f"access_token={len(self.access_token or '')} "
+            f"refresh_token={len(self.refresh_token or '')}"
+        )
+        if not self.id_token and self.access_token:
+            log("⚠️ 响应无 id_token，将尝试用 access_token 调 API（前端正常应用的是 id_token）")
+        if self.id_token:
+            log("✅ 将使用 id_token 作为 API Bearer（与官网前端一致）")
 
     def save_refresh_token_file(self) -> None:
         if not self.refresh_token:
@@ -286,7 +303,7 @@ class MochiClient:
     def refresh_access_token(self) -> bool:
         if not self.refresh_token:
             return False
-        log("🔄 使用 refresh_token 刷新 access_token...")
+        log("🔄 使用 refresh_token 刷新 token...")
         try:
             r = self.session.post(
                 f"{AUTH_BASE}/oauth2/token",
@@ -294,6 +311,8 @@ class MochiClient:
                     "grant_type": "refresh_token",
                     "refresh_token": self.refresh_token,
                     "client_id": CLIENT_ID,
+                    # 部分实现需要 scope 才会返回 id_token
+                    "scope": SCOPE,
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 timeout=REQUEST_TIMEOUT,
@@ -301,8 +320,12 @@ class MochiClient:
             if not r.ok:
                 log(f"⚠️ refresh 失败 HTTP {r.status_code}: {r.text[:300]}")
                 return False
-            self._set_tokens(r.json())
-            return bool(self.access_token)
+            body = r.json()
+            self._set_tokens(body)
+            # 轮换后的 refresh 写文件，方便更新 Secret
+            if body.get("refresh_token"):
+                self.save_refresh_token_file()
+            return bool(self.api_bearer)
         except Exception as e:
             log(f"⚠️ refresh 异常: {e}")
             return False
@@ -381,7 +404,7 @@ class MochiClient:
                 log(f"❌ token 交换失败 HTTP {r.status_code}: {r.text[:400]}")
                 return False
             self._set_tokens(r.json())
-            return bool(self.access_token)
+            return bool(self.api_bearer)
         except Exception as e:
             log(f"❌ PKCE 异常: {e}")
             return False
@@ -618,12 +641,19 @@ class MochiClient:
         log(captcha_help_text())
         return False
 
-    def _api(self, method: str, path: str, **kwargs: Any) -> requests.Response:
-        if not self.access_token:
-            raise RuntimeError("no access_token")
+    def _api(
+        self,
+        method: str,
+        path: str,
+        bearer: str | None = None,
+        **kwargs: Any,
+    ) -> requests.Response:
+        token = bearer or self.api_bearer
+        if not token:
+            raise RuntimeError("no bearer token (need id_token or access_token)")
         headers = {
             **kwargs.pop("headers", {}),
-            "Authorization": f"Bearer {self.access_token}",
+            "Authorization": f"Bearer {token}",
         }
         return self.session.request(
             method,
@@ -633,11 +663,38 @@ class MochiClient:
             **kwargs,
         )
 
+    def _api_with_fallback(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        """
+        优先 id_token；若 401 再试 access_token；仍 401 则 refresh 后重试。
+        """
+        candidates: list[str] = []
+        if self.id_token:
+            candidates.append(self.id_token)
+        if self.access_token and self.access_token not in candidates:
+            candidates.append(self.access_token)
+
+        last: requests.Response | None = None
+        for i, tok in enumerate(candidates):
+            kind = "id_token" if tok == self.id_token else "access_token"
+            r = self._api(method, path, bearer=tok, **kwargs)
+            last = r
+            if r.status_code != 401:
+                if i > 0:
+                    log(f"ℹ️ 使用 {kind} 调用成功")
+                return r
+            log(f"⚠️ {kind} 返回 401，尝试其它 token...")
+
+        if self.refresh_access_token():
+            r = self._api(method, path, **kwargs)
+            return r
+
+        if last is None:
+            raise RuntimeError("no token to call API")
+        return last
+
     def list_servers(self) -> list[dict[str, Any]]:
         log("📋 获取服务器列表...")
-        r = self._api("GET", "/servers")
-        if r.status_code == 401 and self.refresh_access_token():
-            r = self._api("GET", "/servers")
+        r = self._api_with_fallback("GET", "/servers")
         if not r.ok:
             raise RuntimeError(f"list servers failed: {r.status_code} {r.text[:300]}")
         data = r.json()
@@ -651,9 +708,7 @@ class MochiClient:
         return servers
 
     def extend_uptime(self, server_id: str) -> tuple[bool, str]:
-        r = self._api("POST", f"/servers/{server_id}/extend-uptime")
-        if r.status_code == 401 and self.refresh_access_token():
-            r = self._api("POST", f"/servers/{server_id}/extend-uptime")
+        r = self._api_with_fallback("POST", f"/servers/{server_id}/extend-uptime")
         if r.ok:
             try:
                 return True, json.dumps(r.json(), ensure_ascii=False)[:200]
