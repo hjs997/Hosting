@@ -1,0 +1,75 @@
+name: 🍡 Mochi Hosting 自动续期
+
+on:
+  schedule:
+    # 每 6 小时（UTC）
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run renew
+        id: renew
+        continue-on-error: true
+        env:
+          MOCHI_EMAIL: ${{ secrets.MOCHI_EMAIL }}
+          MOCHI_PASSWORD: ${{ secrets.MOCHI_PASSWORD }}
+          MOCHI_REFRESH_TOKEN: ${{ secrets.MOCHI_REFRESH_TOKEN }}
+          MOCHI_SERVER_IDS: ${{ secrets.MOCHI_SERVER_IDS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python renew.py
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mochi-report-${{ github.run_id }}
+          path: |
+            report-notify.md
+            refresh_token.local.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # 防止仓库 60 天无提交被停用
+      - name: Bump time.txt
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "$(date -u +'%Y-%m-%d %H:%M:%S UTC')" > time.txt
+          git add time.txt
+          if git diff --cached --quiet; then
+            echo "no change"
+          else
+            git commit -m "chore: bump time.txt $(date -u +'%Y-%m-%d')"
+            git push origin HEAD:main || true
+          fi
+
+      - name: Fail job if renew failed
+        if: steps.renew.outcome == 'failure'
+        run: exit 1
