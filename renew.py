@@ -43,9 +43,23 @@ SCOPE = os.getenv("MOCHI_SCOPE", "openid profile email offline_access")
 # Cloudflare Turnstile sitekey（从前端 bundle 提取）
 TURNSTILE_SITEKEY = os.getenv("MOCHI_TURNSTILE_SITEKEY", "0x4AAAAAADoOCldXe7KNqkm2")
 
+def _clean_secret(v: str | None) -> str:
+    """去掉首尾空白、引号、Bearer 前缀（粘贴 Secret 时常见）。"""
+    if not v:
+        return ""
+    s = v.strip().strip('"').strip("'").strip()
+    if s.lower().startswith("bearer "):
+        s = s[7:].strip()
+    # 去掉误粘贴的换行
+    s = re.sub(r"\s+", "", s)
+    return s
+
+
 MOCHI_EMAIL = os.getenv("MOCHI_EMAIL") or os.getenv("MOCHI_USERNAME") or ""
 MOCHI_PASSWORD = os.getenv("MOCHI_PASSWORD") or ""
-MOCHI_REFRESH_TOKEN = os.getenv("MOCHI_REFRESH_TOKEN") or ""
+MOCHI_REFRESH_TOKEN = _clean_secret(os.getenv("MOCHI_REFRESH_TOKEN"))
+# 可选：浏览器 Network 里 Authorization: Bearer eyJ... 整段 JWT（有过期时间）
+MOCHI_ID_TOKEN = _clean_secret(os.getenv("MOCHI_ID_TOKEN") or os.getenv("MOCHI_BEARER_TOKEN"))
 MOCHI_SERVER_IDS = os.getenv("MOCHI_SERVER_IDS", "").strip()
 
 # 打码平台（任选其一）
@@ -90,25 +104,50 @@ def random_state() -> str:
     return secrets.token_urlsafe(24)
 
 
-def captcha_help_text() -> str:
+def is_jwt(token: str | None) -> bool:
+    """JWT 形如 xxx.yyy.zzz（两段点），长度通常 > 100。"""
+    if not token or token.count(".") < 2:
+        return False
+    return len(token) >= 80
+
+
+def token_help_text() -> str:
     return """
-❌ 登录需要 Cloudflare Turnstile 验证码，纯密码 API 会被拒绝。
+❌ 当前 Secret 里的 token 无效（长度约 32，且不是 JWT）。
 
-【推荐 · GitHub Actions】
-1) 本机有界面环境运行一次拿 refresh_token:
-   pip install -r requirements.txt
-   playwright install chromium
-   set MOCHI_EMAIL=你的邮箱
-   set MOCHI_PASSWORD=你的密码
-   set USE_PLAYWRIGHT=true
-   set USE_HEADLESS=false
-   python renew.py
-2) 把生成的 refresh_token.local.txt 内容设为 Secret: MOCHI_REFRESH_TOKEN
-3) Actions 里可只配 MOCHI_REFRESH_TOKEN（可不配密码）
+官网 API 需要 Authorization: Bearer <id_token>
+id_token 是很长的 JWT，一般以 eyJ 开头，长度常常 300+，不是 32 位短串。
 
-【可选 · 打码平台】
-配置 CAPSOLVER_API_KEY 或 TWOCAPTCHA_API_KEY，脚本会自动解 Turnstile 后登录。
+========== 请按这个在浏览器里取（不用装 Python）==========
+
+【方法 A · 推荐，复制正在用的 Bearer】
+1. 浏览器登录 https://hosting.aida0710.work/dashboard
+2. 按 F12 → Network（网络）
+3. 刷新页面，点任意一条请求 URL 含 /api/servers 或 /api/
+4. 右侧 Headers → Request Headers → Authorization
+5. 复制 Bearer 后面整段（以 eyJ 开头的超长字符串）
+6. GitHub Secrets 新增/更新：
+   - 名字: MOCHI_ID_TOKEN
+   - 值: 刚才整段 JWT（不要带 Bearer 前缀，不要截断）
+
+注意: id_token 会过期（通常几小时内）。过期后重新复制一次。
+若要长期自动跑，需要正确的 oidc_rt（方法 B）。
+
+【方法 B · localStorage 的 oidc_rt】
+1. 登录后 F12 → Console（控制台）粘贴回车:
+   (() => { const v=localStorage.getItem('oidc_rt'); console.log('len=', v&&v.length); console.log(v); Object.keys(localStorage).forEach(k=>console.log(k, (localStorage.getItem(k)||'').length)); })()
+2. 看 oidc_rt 的 len：
+   - 若只有 20~40：说明不是可用的 OIDC refresh，别用
+   - 若很长：整段复制到 Secret MOCHI_REFRESH_TOKEN
+3. 正确的 refresh 刷新后应出现 id_token（JWT），日志会显示 id_token=300+ 
+
+【方法 C · 打码 + 邮箱密码】
+配置 CAPSOLVER_API_KEY 或 TWOCAPTCHA_API_KEY + MOCHI_EMAIL/PASSWORD
 """.strip()
+
+
+def captcha_help_text() -> str:
+    return token_help_text()
 
 
 # ---------------------------------------------------------------------------
@@ -265,30 +304,45 @@ class MochiClient:
     @property
     def api_bearer(self) -> str | None:
         """
-        门户前端 getToken() 实际返回的是 id_token（不是 access_token）。
-        API 校验: Authorization: Bearer <id_token>
+        门户前端 getToken() 返回 id_token（JWT）。
+        优先 JWT 形态的 id_token，其次 JWT 形态的 access_token。
         """
+        if is_jwt(self.id_token):
+            return self.id_token
+        if is_jwt(self.access_token):
+            return self.access_token
         return self.id_token or self.access_token
 
     def _set_tokens(self, payload: dict[str, Any]) -> None:
-        if payload.get("access_token"):
-            self.access_token = payload["access_token"]
-        if payload.get("refresh_token"):
-            self.refresh_token = payload["refresh_token"]
-        if payload.get("id_token"):
-            self.id_token = payload["id_token"]
+        if not isinstance(payload, dict):
+            log(f"⚠️ token 响应不是 JSON 对象: {type(payload)}")
+            return
 
-        # 调试用：只打长度，避免泄露 token
+        log(f"ℹ️ token 响应字段: {list(payload.keys())}")
+
+        if payload.get("access_token"):
+            self.access_token = str(payload["access_token"]).strip()
+        if payload.get("refresh_token"):
+            self.refresh_token = str(payload["refresh_token"]).strip()
+        if payload.get("id_token"):
+            self.id_token = str(payload["id_token"]).strip()
+
+        # 有的实现把 token 放在 data/token 里
+        if not self.access_token and payload.get("token"):
+            self.access_token = str(payload["token"]).strip()
+
         log(
-            "✅ token 响应: "
-            f"id_token={len(self.id_token or '')} "
-            f"access_token={len(self.access_token or '')} "
+            "✅ token 长度: "
+            f"id_token={len(self.id_token or '')}(jwt={is_jwt(self.id_token)}) "
+            f"access_token={len(self.access_token or '')}(jwt={is_jwt(self.access_token)}) "
             f"refresh_token={len(self.refresh_token or '')}"
         )
-        if not self.id_token and self.access_token:
-            log("⚠️ 响应无 id_token，将尝试用 access_token 调 API（前端正常应用的是 id_token）")
-        if self.id_token:
-            log("✅ 将使用 id_token 作为 API Bearer（与官网前端一致）")
+        if self.id_token and is_jwt(self.id_token):
+            log("✅ 将使用 id_token (JWT) 作为 API Bearer")
+        elif self.access_token and is_jwt(self.access_token):
+            log("✅ 无 id_token，将使用 access_token (JWT)")
+        else:
+            log("⚠️ 没有 JWT 形态的 token，API 大概率会 401")
 
     def save_refresh_token_file(self) -> None:
         if not self.refresh_token:
@@ -303,29 +357,49 @@ class MochiClient:
     def refresh_access_token(self) -> bool:
         if not self.refresh_token:
             return False
-        log("🔄 使用 refresh_token 刷新 token...")
+
+        rt = self.refresh_token
+        log(f"🔄 使用 refresh_token 刷新 (len={len(rt)}, jwt={is_jwt(rt)})...")
+        if len(rt) < 40 and not is_jwt(rt):
+            log("⚠️ refresh_token 过短，通常不是 OIDC 的 oidc_rt，刷新后也很难拿到 id_token")
+
         try:
             r = self.session.post(
                 f"{AUTH_BASE}/oauth2/token",
                 data={
                     "grant_type": "refresh_token",
-                    "refresh_token": self.refresh_token,
+                    "refresh_token": rt,
                     "client_id": CLIENT_ID,
-                    # 部分实现需要 scope 才会返回 id_token
                     "scope": SCOPE,
                 },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                    "Origin": PORTAL_ORIGIN,
+                },
                 timeout=REQUEST_TIMEOUT,
             )
             if not r.ok:
                 log(f"⚠️ refresh 失败 HTTP {r.status_code}: {r.text[:300]}")
                 return False
-            body = r.json()
+            try:
+                body = r.json()
+            except Exception:
+                log(f"⚠️ refresh 响应非 JSON: {r.text[:300]}")
+                return False
+
             self._set_tokens(body)
-            # 轮换后的 refresh 写文件，方便更新 Secret
-            if body.get("refresh_token"):
+
+            # 刷新成功但没有 JWT → 视为失败，避免假成功
+            if not is_jwt(self.id_token) and not is_jwt(self.access_token):
+                log("❌ 刷新结果没有 JWT（id_token/access_token 都不是 eyJ... 长串）")
+                log(token_help_text())
+                return False
+
+            if body.get("refresh_token") and body["refresh_token"] != rt:
+                log("ℹ️ refresh_token 已轮换，请把 refresh_token.local.txt 更新到 Secret")
                 self.save_refresh_token_file()
-            return bool(self.api_bearer)
+            return True
         except Exception as e:
             log(f"⚠️ refresh 异常: {e}")
             return False
@@ -609,9 +683,21 @@ class MochiClient:
             return False
 
     def ensure_auth(self) -> bool:
-        # 1) refresh
-        if self.refresh_token and self.refresh_access_token():
+        # 0) 直接使用浏览器复制的 id_token / Bearer JWT
+        if MOCHI_ID_TOKEN:
+            log(f"🔑 使用 MOCHI_ID_TOKEN (len={len(MOCHI_ID_TOKEN)}, jwt={is_jwt(MOCHI_ID_TOKEN)})")
+            if not is_jwt(MOCHI_ID_TOKEN):
+                log("❌ MOCHI_ID_TOKEN 不是 JWT（应以 eyJ 开头、含两个点、很长）")
+                log(token_help_text())
+                return False
+            self.id_token = MOCHI_ID_TOKEN
             return True
+
+        # 1) refresh → 必须拿到 JWT
+        if self.refresh_token:
+            if self.refresh_access_token():
+                return True
+            log("⚠️ refresh 路径失败，尝试其它登录方式...")
 
         has_password = bool(MOCHI_EMAIL and MOCHI_PASSWORD)
         has_solver = bool(CAPSOLVER_API_KEY or TWOCAPTCHA_API_KEY)
@@ -621,24 +707,26 @@ class MochiClient:
             captcha = solve_turnstile(f"{AUTH_ORIGIN}/login")
             if captcha and self.login_with_password(MOCHI_EMAIL, MOCHI_PASSWORD, captcha):
                 if self.obtain_token_via_pkce():
-                    self.save_refresh_token_file()
-                    return True
+                    if is_jwt(self.api_bearer):
+                        self.save_refresh_token_file()
+                        return True
+                    log("❌ PKCE 完成后仍无 JWT")
 
-        # 3) Playwright（显式开启，或本机未配 refresh/打码时自动尝试）
+        # 3) Playwright
         use_pw = USE_PLAYWRIGHT or (has_password and not IS_GITHUB_ACTIONS and not has_solver)
         if has_password and use_pw:
-            if self.login_via_playwright():
+            if self.login_via_playwright() and is_jwt(self.api_bearer):
                 return True
 
-        # 4) 纯密码（无 captcha）— 会失败，但给出说明
-        if has_password and not has_solver:
-            log("⚠️ 尝试无验证码密码登录（预计失败，站点已强制 Turnstile）...")
+        # 4) 纯密码（预计失败）
+        if has_password and not has_solver and not self.refresh_token:
+            log("⚠️ 尝试无验证码密码登录（预计失败）...")
             if self.login_with_password(MOCHI_EMAIL, MOCHI_PASSWORD, None):
-                if self.obtain_token_via_pkce():
+                if self.obtain_token_via_pkce() and is_jwt(self.api_bearer):
                     self.save_refresh_token_file()
                     return True
 
-        log(captcha_help_text())
+        log(token_help_text())
         return False
 
     def _api(
@@ -776,10 +864,16 @@ def main() -> int:
     log(f"Playwright: use={USE_PLAYWRIGHT} headless={USE_HEADLESS} gha={IS_GITHUB_ACTIONS}")
     log("=" * 60)
 
-    if not MOCHI_REFRESH_TOKEN and not (MOCHI_EMAIL and MOCHI_PASSWORD):
-        log("❌ 请配置 MOCHI_REFRESH_TOKEN，或 MOCHI_EMAIL + MOCHI_PASSWORD")
-        log(captcha_help_text())
+    if not MOCHI_ID_TOKEN and not MOCHI_REFRESH_TOKEN and not (MOCHI_EMAIL and MOCHI_PASSWORD):
+        log("❌ 请配置 MOCHI_ID_TOKEN，或 MOCHI_REFRESH_TOKEN，或 邮箱密码+打码")
+        log(token_help_text())
         return 1
+
+    if MOCHI_REFRESH_TOKEN and len(MOCHI_REFRESH_TOKEN) < 40:
+        log(
+            f"⚠️ MOCHI_REFRESH_TOKEN 长度只有 {len(MOCHI_REFRESH_TOKEN)}，"
+            "很像复制错了（正确 oidc_rt 通常更长）"
+        )
 
     client = MochiClient()
     tg = TelegramNotifier()
