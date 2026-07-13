@@ -2,7 +2,6 @@ name: 🍡 Mochi Hosting 自动续期
 
 on:
   schedule:
-    # 每 6 小时（UTC）
     - cron: '0 */6 * * *'
   workflow_dispatch:
 
@@ -30,7 +29,43 @@ jobs:
             ${{ runner.os }}-pip-
 
       - name: Install deps
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          # GHA 推荐只用 refresh_token，一般不需要浏览器；有打码密钥时也不需要 playwright 浏览器
+          # 如要用 Playwright 兜底可取消下一行注释：
+          # python -m playwright install chromium
+
+      - name: Check secrets
+        env:
+          MOCHI_ID_TOKEN: ${{ secrets.MOCHI_ID_TOKEN }}
+          MOCHI_REFRESH_TOKEN: ${{ secrets.MOCHI_REFRESH_TOKEN }}
+          MOCHI_EMAIL: ${{ secrets.MOCHI_EMAIL }}
+          MOCHI_PASSWORD: ${{ secrets.MOCHI_PASSWORD }}
+          CAPSOLVER_API_KEY: ${{ secrets.CAPSOLVER_API_KEY }}
+          TWOCAPTCHA_API_KEY: ${{ secrets.TWOCAPTCHA_API_KEY }}
+        run: |
+          if [ -n "$MOCHI_ID_TOKEN" ]; then
+            echo "OK: MOCHI_ID_TOKEN set (len=${#MOCHI_ID_TOKEN})"
+            exit 0
+          fi
+          if [ -n "$MOCHI_REFRESH_TOKEN" ]; then
+            echo "OK: MOCHI_REFRESH_TOKEN set (len=${#MOCHI_REFRESH_TOKEN})"
+            if [ "${#MOCHI_REFRESH_TOKEN}" -lt 40 ]; then
+              echo "WARN: refresh_token 太短，可能复制错了。正确 JWT/oidc_rt 通常更长。"
+            fi
+            exit 0
+          fi
+          if [ -n "$CAPSOLVER_API_KEY" ] || [ -n "$TWOCAPTCHA_API_KEY" ]; then
+            if [ -n "$MOCHI_EMAIL" ] && [ -n "$MOCHI_PASSWORD" ]; then
+              echo "OK: captcha solver + password"
+              exit 0
+            fi
+          fi
+          echo "需要至少一种认证方式:"
+          echo "  1) MOCHI_ID_TOKEN = 浏览器 Network 里 Authorization Bearer 的 JWT（eyJ 开头）"
+          echo "  2) MOCHI_REFRESH_TOKEN = localStorage.oidc_rt（必须是长串，不是 32 位）"
+          echo "  3) 打码 KEY + 邮箱密码"
+          exit 1
 
       - name: Run renew
         id: renew
@@ -39,9 +74,13 @@ jobs:
           MOCHI_EMAIL: ${{ secrets.MOCHI_EMAIL }}
           MOCHI_PASSWORD: ${{ secrets.MOCHI_PASSWORD }}
           MOCHI_REFRESH_TOKEN: ${{ secrets.MOCHI_REFRESH_TOKEN }}
+          MOCHI_ID_TOKEN: ${{ secrets.MOCHI_ID_TOKEN }}
           MOCHI_SERVER_IDS: ${{ secrets.MOCHI_SERVER_IDS }}
+          CAPSOLVER_API_KEY: ${{ secrets.CAPSOLVER_API_KEY }}
+          TWOCAPTCHA_API_KEY: ${{ secrets.TWOCAPTCHA_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          USE_PLAYWRIGHT: 'false'
         run: python renew.py
 
       - name: Upload report
@@ -52,10 +91,10 @@ jobs:
           path: |
             report-notify.md
             refresh_token.local.txt
+            mochi_*.png
           if-no-files-found: ignore
           retention-days: 7
 
-      # 防止仓库 60 天无提交被停用
       - name: Bump time.txt
         if: always()
         run: |
@@ -70,6 +109,6 @@ jobs:
             git push origin HEAD:main || true
           fi
 
-      - name: Fail job if renew failed
+      - name: Fail if renew failed
         if: steps.renew.outcome == 'failure'
         run: exit 1
