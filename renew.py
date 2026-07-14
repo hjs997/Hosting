@@ -5,11 +5,15 @@ Mochi Hosting (hosting.aida0710.work) 自动续期脚本
 
 续期: POST /api/servers/{id}/extend-uptime
 
-认证优先级:
-1. MOCHI_REFRESH_TOKEN 刷新 access_token（推荐，GitHub Actions 必用此方式）
-2. 邮箱密码 + Cloudflare Turnstile
-   - 可选 CAPSOLVER_API_KEY / TWOCAPTCHA_API_KEY 自动打码
-   - 或 USE_PLAYWRIGHT=true 浏览器登录（本机有头模式可过人机；GHA 无头常被拦）
+认证说明（重要）:
+- Hosting API 只要 Authorization: Bearer <id_token JWT>
+- Better Auth 的 refresh_token(oidc_rt) 刷新后通常只返回【不透明】access_token，
+  没有 id_token → 单独配 MOCHI_REFRESH_TOKEN 会对 API 401（这是服务端行为，不是复制错）
+- 真正能自动拿到 JWT 的长期方式:
+  1) MOCHI_SESSION_TOKEN = Cookie __Secure-better-auth.session_token（账号站会话）
+     → 脚本用 OIDC PKCE(prompt=none) 换 id_token（与浏览器静默登录相同）
+  2) 邮箱密码 + 打码 / Playwright
+  3) 临时: MOCHI_ID_TOKEN（会过期）
 """
 
 from __future__ import annotations
@@ -60,7 +64,14 @@ MOCHI_PASSWORD = os.getenv("MOCHI_PASSWORD") or ""
 MOCHI_REFRESH_TOKEN = _clean_secret(os.getenv("MOCHI_REFRESH_TOKEN"))
 # 可选：浏览器 Network 里 Authorization: Bearer eyJ... 整段 JWT（有过期时间）
 MOCHI_ID_TOKEN = _clean_secret(os.getenv("MOCHI_ID_TOKEN") or os.getenv("MOCHI_BEARER_TOKEN"))
+# 推荐长期：auth.aida0710.work 的 Cookie __Secure-better-auth.session_token 的值
+MOCHI_SESSION_TOKEN = _clean_secret(
+    os.getenv("MOCHI_SESSION_TOKEN")
+    or os.getenv("MOCHI_SESSION_COOKIE")
+    or os.getenv("BETTER_AUTH_SESSION_TOKEN")
+)
 MOCHI_SERVER_IDS = os.getenv("MOCHI_SERVER_IDS", "").strip()
+SESSION_COOKIE_NAME = "__Secure-better-auth.session_token"
 
 # 打码平台（任选其一）
 CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY") or ""
@@ -111,40 +122,81 @@ def is_jwt(token: str | None) -> bool:
     return len(token) >= 80
 
 
+def jwt_payload(token: str | None) -> dict[str, Any] | None:
+    """不校验签名，只解码 JWT payload（用于看 exp）。"""
+    if not is_jwt(token):
+        return None
+    try:
+        part = (token or "").split(".")[1]
+        pad = (-len(part)) % 4
+        if pad:
+            part += "=" * pad
+        raw = base64.urlsafe_b64decode(part.encode("ascii"))
+        data = json.loads(raw.decode("utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def jwt_seconds_left(token: str | None) -> int | None:
+    """距离 exp 还剩多少秒；无法解析返回 None；已过期返回负数。"""
+    payload = jwt_payload(token)
+    if not payload or "exp" not in payload:
+        return None
+    try:
+        exp = int(payload["exp"])
+    except (TypeError, ValueError):
+        return None
+    return exp - int(time.time())
+
+
+def jwt_is_expired(token: str | None, skew_seconds: int = 60) -> bool:
+    """
+    True = 已过期或即将过期（默认 60s 缓冲）。
+    无法解析 exp 时返回 False（交给 API 401 再处理）。
+    """
+    left = jwt_seconds_left(token)
+    if left is None:
+        return False
+    return left <= skew_seconds
+
+
+def format_jwt_exp(token: str | None) -> str:
+    left = jwt_seconds_left(token)
+    if left is None:
+        return "exp=unknown"
+    if left <= 0:
+        return f"exp=已过期({-left}s前)"
+    if left < 3600:
+        return f"exp≈{left}s后"
+    return f"exp≈{left // 3600}h{(left % 3600) // 60}m后"
+
+
 def token_help_text() -> str:
     return """
-❌ 当前 Secret 里的 token 无效（长度约 32，且不是 JWT）。
+❌ 认证失败。
 
-官网 API 需要 Authorization: Bearer <id_token>
-id_token 是很长的 JWT，一般以 eyJ 开头，长度常常 300+，不是 32 位短串。
+【关键】Hosting API 只要 Bearer <id_token JWT>。
+oidc_rt / MOCHI_REFRESH_TOKEN 刷新后，Better Auth 通常只返回不透明 access_token，
+没有 id_token → 单独配 refresh 会对 /api 401（服务端行为，不是复制错）。
 
-========== 请按这个在浏览器里取（不用装 Python）==========
+========== 方法 A · 推荐 · 会话 Cookie ==========
+1. F12 → Application → Cookies → https://auth.aida0710.work
+2. 找到 Cookie 名: __Secure-better-auth.session_token
+3. 复制 Value 整段
+4. GitHub Secret Name: MOCHI_SESSION_TOKEN  = 该 Value
+脚本会用它走 OIDC（与浏览器静默登录相同）换出 JWT。
 
-【方法 A · 推荐，复制正在用的 Bearer】
-1. 浏览器登录 https://hosting.aida0710.work/dashboard
-2. 按 F12 → Network（网络）
-3. 刷新页面，点任意一条请求 URL 含 /api/servers 或 /api/
-4. 右侧 Headers → Request Headers → Authorization
-5. 复制 Bearer 后面整段（以 eyJ 开头的超长字符串）
-6. GitHub Secrets 新增/更新：
-   - 名字: MOCHI_ID_TOKEN
-   - 值: 刚才整段 JWT（不要带 Bearer 前缀，不要截断）
+========== 方法 B · 临时 · MOCHI_ID_TOKEN ==========
+hosting 面板 Network → /api/servers → Authorization → Bearer 后 eyJ...
+（几小时过期）
 
-注意: id_token 会过期（通常几小时内）。过期后重新复制一次。
-若要长期自动跑，需要正确的 oidc_rt（方法 B）。
+========== 方法 C · 邮箱密码 + 打码 ==========
+MOCHI_EMAIL + MOCHI_PASSWORD + CAPSOLVER_API_KEY 或 TWOCAPTCHA_API_KEY
 
-【方法 B · localStorage 的 oidc_rt】
-1. 登录后 F12 → Console（控制台）粘贴回车:
-   (() => { const v=localStorage.getItem('oidc_rt'); console.log('len=', v&&v.length); console.log(v); Object.keys(localStorage).forEach(k=>console.log(k, (localStorage.getItem(k)||'').length)); })()
-2. 看 oidc_rt 的 len：
-   - 若只有 20~40：说明不是可用的 OIDC refresh，别用
-   - 若很长：整段复制到 Secret MOCHI_REFRESH_TOKEN
-3. 正确的 refresh 刷新后应出现 id_token（JWT），日志会显示 id_token=300+ 
-
-【方法 C · 打码 + 邮箱密码】
-配置 CAPSOLVER_API_KEY 或 TWOCAPTCHA_API_KEY + MOCHI_EMAIL/PASSWORD
+========== 关于 oidc_rt ==========
+可以保留，但单独不够；需配合 session 或密码登录拿 JWT。
 """.strip()
-
 
 def captcha_help_text() -> str:
     return token_help_text()
@@ -355,27 +407,36 @@ class MochiClient:
             log(f"⚠️ 写 refresh_token 文件失败: {e}")
 
     def refresh_access_token(self) -> bool:
+        """
+        调用 oauth2/token refresh_token grant。
+        注意: Better Auth 当前常只返回不透明 access_token + 新 refresh_token，
+        没有 id_token JWT → 对 Hosting API 仍然不够，返回 False。
+        """
         if not self.refresh_token:
             return False
 
         rt = self.refresh_token
-        log(f"🔄 使用 refresh_token 刷新 (len={len(rt)}, jwt={is_jwt(rt)})...")
-        if len(rt) < 40 and not is_jwt(rt):
-            log("⚠️ refresh_token 过短，通常不是 OIDC 的 oidc_rt，刷新后也很难拿到 id_token")
+        log(
+            f"🔄 使用 refresh_token 刷新 "
+            f"(len={len(rt)}, jwt={is_jwt(rt)}, opaque={not is_jwt(rt)})..."
+        )
+        if len(rt) < 16:
+            log("⚠️ refresh_token 过短（<16），可能复制不完整")
 
         try:
+            # 与门户 openid-client 一致: grant_type + refresh_token + client_id
             r = self.session.post(
                 f"{AUTH_BASE}/oauth2/token",
                 data={
                     "grant_type": "refresh_token",
                     "refresh_token": rt,
                     "client_id": CLIENT_ID,
-                    "scope": SCOPE,
                 },
                 headers={
                     "Content-Type": "application/x-www-form-urlencoded",
                     "Accept": "application/json",
                     "Origin": PORTAL_ORIGIN,
+                    "Referer": PORTAL_ORIGIN + "/",
                 },
                 timeout=REQUEST_TIMEOUT,
             )
@@ -390,19 +451,63 @@ class MochiClient:
 
             self._set_tokens(body)
 
-            # 刷新成功但没有 JWT → 视为失败，避免假成功
-            if not is_jwt(self.id_token) and not is_jwt(self.access_token):
-                log("❌ 刷新结果没有 JWT（id_token/access_token 都不是 eyJ... 长串）")
-                log(token_help_text())
-                return False
-
+            # refresh 会轮换 oidc_rt，必须落盘（即便没有 JWT）
             if body.get("refresh_token") and body["refresh_token"] != rt:
-                log("ℹ️ refresh_token 已轮换，请把 refresh_token.local.txt 更新到 Secret")
+                log("ℹ️ refresh_token 已轮换，已写入 refresh_token.local.txt（请更新 Secret）")
                 self.save_refresh_token_file()
-            return True
+
+            if is_jwt(self.id_token) or is_jwt(self.access_token):
+                return True
+
+            log(
+                "⚠️ refresh 成功但没有 id_token JWT（只有不透明 access_token）。"
+                " Hosting API 不接受该 access_token，需要 session Cookie 走 OIDC 或临时 id_token。"
+            )
+            return False
         except Exception as e:
             log(f"⚠️ refresh 异常: {e}")
             return False
+
+    def inject_session_cookie(self, token: str | None = None) -> bool:
+        """注入 Better Auth 会话 Cookie（auth.aida0710.work）。"""
+        val = (token or MOCHI_SESSION_TOKEN or "").strip()
+        if not val:
+            return False
+        # requests 对 __Secure- cookie 需要 secure=True；domain 不带点
+        for domain in ("auth.aida0710.work", ".aida0710.work"):
+            try:
+                self.session.cookies.set(
+                    SESSION_COOKIE_NAME,
+                    val,
+                    domain=domain,
+                    path="/",
+                    secure=True,
+                )
+            except Exception:
+                pass
+        # 再设一份默认（有的环境 domain 限制导致带不上）
+        self.session.cookies.set(SESSION_COOKIE_NAME, val)
+        log(f"🍪 已注入 {SESSION_COOKIE_NAME} (len={len(val)})")
+        return True
+
+    def obtain_token_via_session(self) -> bool:
+        """
+        用 Better Auth session Cookie 做 OIDC 授权码（与浏览器 silent auth 相同），
+        换取 id_token JWT。这是当前对 Hosting API 最稳的自动路径。
+        """
+        if not self.inject_session_cookie():
+            return False
+        log("🎫 使用 session Cookie 走 OIDC PKCE（prompt=none）...")
+        if self.obtain_token_via_pkce(prompt="none"):
+            if is_jwt(self.api_bearer):
+                self.save_refresh_token_file()
+                return True
+        log("⚠️ prompt=none 未拿到 JWT，再试无 prompt 的授权...")
+        if self.obtain_token_via_pkce(prompt=None):
+            if is_jwt(self.api_bearer):
+                self.save_refresh_token_file()
+                return True
+        return False
 
     def login_with_password(self, email: str, password: str, captcha: str | None) -> bool:
         log(f"🔐 邮箱登录: {email}")
@@ -441,12 +546,12 @@ class MochiClient:
             log(f"❌ 登录异常: {e}")
             return False
 
-    def obtain_token_via_pkce(self) -> bool:
-        log("🎫 OIDC PKCE 授权码流程...")
+    def obtain_token_via_pkce(self, prompt: str | None = None) -> bool:
+        log(f"🎫 OIDC PKCE 授权码流程 (prompt={prompt!r})...")
         verifier, challenge = pkce_pair()
         state = random_state()
         nonce = random_state()
-        params = {
+        params: dict[str, str] = {
             "client_id": CLIENT_ID,
             "redirect_uri": REDIRECT_URI,
             "response_type": "code",
@@ -456,6 +561,8 @@ class MochiClient:
             "state": state,
             "nonce": nonce,
         }
+        if prompt:
+            params["prompt"] = prompt
         authorize_url = f"{AUTH_BASE}/oauth2/authorize?{urlencode(params)}"
         try:
             code = self._follow_authorize_for_code(authorize_url, state)
@@ -471,14 +578,25 @@ class MochiClient:
                     "client_id": CLIENT_ID,
                     "code_verifier": verifier,
                 },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                    "Origin": PORTAL_ORIGIN,
+                    "Referer": PORTAL_ORIGIN + "/",
+                },
                 timeout=REQUEST_TIMEOUT,
             )
             if not r.ok:
                 log(f"❌ token 交换失败 HTTP {r.status_code}: {r.text[:400]}")
                 return False
-            self._set_tokens(r.json())
-            return bool(self.api_bearer)
+            body = r.json()
+            self._set_tokens(body)
+            if body.get("refresh_token"):
+                self.save_refresh_token_file()
+            ok = is_jwt(self.api_bearer)
+            if not ok:
+                log("⚠️ code 交换成功但结果不是 JWT")
+            return ok
         except Exception as e:
             log(f"❌ PKCE 异常: {e}")
             return False
@@ -496,7 +614,17 @@ class MochiClient:
                 },
             )
             loc = r.headers.get("Location") or r.headers.get("location")
-            log(f"  ↳ hop{hop}: HTTP {r.status_code} loc={(loc or '')[:120]}")
+            log(f"  ↳ hop{hop}: HTTP {r.status_code} loc={(loc or '')[:160]}")
+
+            # prompt=none 未登录时会带 error=login_required
+            for check in (r.url, loc or ""):
+                if check and "error=" in check:
+                    qs = parse_qs(urlparse(check).query)
+                    err = (qs.get("error") or [None])[0]
+                    desc = (qs.get("error_description") or [""])[0]
+                    if err:
+                        log(f"⚠️ 授权错误: {err} {desc}")
+                        return None
 
             code = self._extract_code(r.url, expected_state)
             if code:
@@ -682,28 +810,15 @@ class MochiClient:
             log(f"❌ Playwright 异常: {e}")
             return False
 
-    def ensure_auth(self) -> bool:
-        # 0) 直接使用浏览器复制的 id_token / Bearer JWT
-        if MOCHI_ID_TOKEN:
-            log(f"🔑 使用 MOCHI_ID_TOKEN (len={len(MOCHI_ID_TOKEN)}, jwt={is_jwt(MOCHI_ID_TOKEN)})")
-            if not is_jwt(MOCHI_ID_TOKEN):
-                log("❌ MOCHI_ID_TOKEN 不是 JWT（应以 eyJ 开头、含两个点、很长）")
-                log(token_help_text())
-                return False
-            self.id_token = MOCHI_ID_TOKEN
-            return True
-
-        # 1) refresh → 必须拿到 JWT
-        if self.refresh_token:
-            if self.refresh_access_token():
-                return True
-            log("⚠️ refresh 路径失败，尝试其它登录方式...")
-
+    def _try_password_login_paths(self) -> bool:
+        """邮箱密码 + 打码 / Playwright / 裸登录。成功则 self 上已有 JWT。"""
         has_password = bool(MOCHI_EMAIL and MOCHI_PASSWORD)
         has_solver = bool(CAPSOLVER_API_KEY or TWOCAPTCHA_API_KEY)
+        if not has_password:
+            return False
 
-        # 2) 密码 + 打码
-        if has_password and has_solver:
+        # 密码 + 打码
+        if has_solver:
             captcha = solve_turnstile(f"{AUTH_ORIGIN}/login")
             if captcha and self.login_with_password(MOCHI_EMAIL, MOCHI_PASSWORD, captcha):
                 if self.obtain_token_via_pkce():
@@ -712,19 +827,67 @@ class MochiClient:
                         return True
                     log("❌ PKCE 完成后仍无 JWT")
 
-        # 3) Playwright
-        use_pw = USE_PLAYWRIGHT or (has_password and not IS_GITHUB_ACTIONS and not has_solver)
-        if has_password and use_pw:
+        # Playwright
+        use_pw = USE_PLAYWRIGHT or (not IS_GITHUB_ACTIONS and not has_solver)
+        if use_pw:
             if self.login_via_playwright() and is_jwt(self.api_bearer):
                 return True
 
-        # 4) 纯密码（预计失败）
-        if has_password and not has_solver and not self.refresh_token:
+        # 纯密码（预计失败，仅在无打码且无 refresh 时试）
+        if not has_solver and not self.refresh_token:
             log("⚠️ 尝试无验证码密码登录（预计失败）...")
             if self.login_with_password(MOCHI_EMAIL, MOCHI_PASSWORD, None):
                 if self.obtain_token_via_pkce() and is_jwt(self.api_bearer):
                     self.save_refresh_token_file()
                     return True
+        return False
+
+    def ensure_auth(self) -> bool:
+        """
+        优先级（以能否拿到 Hosting 可用的 JWT 为准）:
+        1. MOCHI_SESSION_TOKEN → OIDC PKCE → id_token JWT   【推荐长期】
+        2. 未过期的 MOCHI_ID_TOKEN
+        3. refresh_token（通常拿不到 JWT，失败后继续）
+        4. 邮箱密码 + 打码 / Playwright
+        """
+        # 1) session cookie → OIDC（与浏览器静默登录相同）
+        if MOCHI_SESSION_TOKEN:
+            log(f"🔑 优先 MOCHI_SESSION_TOKEN (len={len(MOCHI_SESSION_TOKEN)})")
+            if self.obtain_token_via_session():
+                return True
+            log("⚠️ session Cookie OIDC 失败（可能过期），尝试其它方式...")
+
+        # 2) 未过期 id_token
+        if MOCHI_ID_TOKEN:
+            log(
+                f"🔑 检查 MOCHI_ID_TOKEN "
+                f"(len={len(MOCHI_ID_TOKEN)}, jwt={is_jwt(MOCHI_ID_TOKEN)}, "
+                f"{format_jwt_exp(MOCHI_ID_TOKEN)})"
+            )
+            if not is_jwt(MOCHI_ID_TOKEN):
+                log("❌ MOCHI_ID_TOKEN 不是 JWT")
+            elif jwt_is_expired(MOCHI_ID_TOKEN):
+                log("⚠️ MOCHI_ID_TOKEN 已过期/即将过期，跳过")
+            else:
+                self.id_token = MOCHI_ID_TOKEN
+                log("✅ 使用未过期的 MOCHI_ID_TOKEN（临时）")
+                return True
+
+        # 3) refresh（Better Auth 常无 id_token；有 JWT 才算成功）
+        if self.refresh_token:
+            log(
+                f"🔑 尝试 MOCHI_REFRESH_TOKEN "
+                f"(len={len(self.refresh_token)}) — 通常不能单独拿 JWT"
+            )
+            if self.refresh_access_token():
+                return True
+            # refresh 失败后，若后来注入了 session 再试一次 session
+            if MOCHI_SESSION_TOKEN and self.obtain_token_via_session():
+                return True
+
+        # 4) 密码 + 打码 / Playwright
+        if self._try_password_login_paths():
+            return True
 
         log(token_help_text())
         return False
@@ -753,7 +916,9 @@ class MochiClient:
 
     def _api_with_fallback(self, method: str, path: str, **kwargs: Any) -> requests.Response:
         """
-        优先 id_token；若 401 再试 access_token；仍 401 则 refresh 后重试。
+        优先 id_token；401 再试 access_token；
+        仍 401 则 refresh 刷新后重试；
+        再失败则完整重登一次（打码/密码，若已配置）。
         """
         candidates: list[str] = []
         if self.id_token:
@@ -772,9 +937,31 @@ class MochiClient:
                 return r
             log(f"⚠️ {kind} 返回 401，尝试其它 token...")
 
-        if self.refresh_access_token():
+        # refresh 换新 JWT
+        if self.refresh_token and self.refresh_access_token():
             r = self._api(method, path, **kwargs)
-            return r
+            if r.status_code != 401:
+                return r
+            last = r
+            log("⚠️ refresh 后仍 401...")
+
+        # 完整重登一次（避免无限循环）
+        if not getattr(self, "_reauth_once", False):
+            self._reauth_once = True
+            log("🔁 API 401，尝试完整重新登录...")
+            old_id, old_at = self.id_token, self.access_token
+            self.id_token = None
+            self.access_token = None
+            # 保留 refresh；若 refresh 已坏再走密码
+            ok = False
+            if self.refresh_token:
+                ok = self.refresh_access_token()
+            if not ok:
+                ok = self._try_password_login_paths()
+            if ok and is_jwt(self.api_bearer):
+                r = self._api(method, path, **kwargs)
+                return r
+            self.id_token, self.access_token = old_id, old_at
 
         if last is None:
             raise RuntimeError("no token to call API")
@@ -859,20 +1046,35 @@ def main() -> int:
     log(f"时间: {now_beijing()}")
     log(f"API: {API_BASE}")
     log(f"Auth: {AUTH_BASE}")
-    log(f"有 refresh_token: {bool(MOCHI_REFRESH_TOKEN)}")
+    log(
+        f"有 session: {bool(MOCHI_SESSION_TOKEN)} "
+        f"有 refresh_token: {bool(MOCHI_REFRESH_TOKEN)} "
+        f"有 id_token: {bool(MOCHI_ID_TOKEN)} "
+        f"有邮箱密码: {bool(MOCHI_EMAIL and MOCHI_PASSWORD)}"
+    )
+    if MOCHI_ID_TOKEN:
+        log(f"  id_token: len={len(MOCHI_ID_TOKEN)} {format_jwt_exp(MOCHI_ID_TOKEN)}")
     log(f"打码: capsolver={bool(CAPSOLVER_API_KEY)} 2captcha={bool(TWOCAPTCHA_API_KEY)}")
     log(f"Playwright: use={USE_PLAYWRIGHT} headless={USE_HEADLESS} gha={IS_GITHUB_ACTIONS}")
     log("=" * 60)
 
-    if not MOCHI_ID_TOKEN and not MOCHI_REFRESH_TOKEN and not (MOCHI_EMAIL and MOCHI_PASSWORD):
-        log("❌ 请配置 MOCHI_ID_TOKEN，或 MOCHI_REFRESH_TOKEN，或 邮箱密码+打码")
+    if not any(
+        [
+            MOCHI_SESSION_TOKEN,
+            MOCHI_ID_TOKEN,
+            MOCHI_REFRESH_TOKEN,
+            (MOCHI_EMAIL and MOCHI_PASSWORD),
+        ]
+    ):
+        log("❌ 请配置 MOCHI_SESSION_TOKEN（推荐），或 MOCHI_ID_TOKEN，或 邮箱密码+打码")
         log(token_help_text())
         return 1
 
-    if MOCHI_REFRESH_TOKEN and len(MOCHI_REFRESH_TOKEN) < 40:
+    if MOCHI_REFRESH_TOKEN and not MOCHI_SESSION_TOKEN and not MOCHI_ID_TOKEN:
         log(
-            f"⚠️ MOCHI_REFRESH_TOKEN 长度只有 {len(MOCHI_REFRESH_TOKEN)}，"
-            "很像复制错了（正确 oidc_rt 通常更长）"
+            "⚠️ 只配了 MOCHI_REFRESH_TOKEN：Better Auth 刷新通常不返回 id_token JWT，"
+            "Hosting API 会 401。请改配 Cookie __Secure-better-auth.session_token → "
+            "Secret MOCHI_SESSION_TOKEN。"
         )
 
     client = MochiClient()
