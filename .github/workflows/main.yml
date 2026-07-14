@@ -37,6 +37,7 @@ jobs:
 
       - name: Check secrets
         env:
+          MOCHI_SESSION_TOKEN: ${{ secrets.MOCHI_SESSION_TOKEN }}
           MOCHI_ID_TOKEN: ${{ secrets.MOCHI_ID_TOKEN }}
           MOCHI_REFRESH_TOKEN: ${{ secrets.MOCHI_REFRESH_TOKEN }}
           MOCHI_EMAIL: ${{ secrets.MOCHI_EMAIL }}
@@ -44,15 +45,20 @@ jobs:
           CAPSOLVER_API_KEY: ${{ secrets.CAPSOLVER_API_KEY }}
           TWOCAPTCHA_API_KEY: ${{ secrets.TWOCAPTCHA_API_KEY }}
         run: |
+          # 推荐：Better Auth session cookie → OIDC 换 JWT
+          if [ -n "$MOCHI_SESSION_TOKEN" ]; then
+            echo "OK: MOCHI_SESSION_TOKEN set (len=${#MOCHI_SESSION_TOKEN}) [recommended]"
+            exit 0
+          fi
           if [ -n "$MOCHI_ID_TOKEN" ]; then
-            echo "OK: MOCHI_ID_TOKEN set (len=${#MOCHI_ID_TOKEN})"
+            echo "WARN: 仅有 MOCHI_ID_TOKEN（会过期）。长期请配 MOCHI_SESSION_TOKEN"
+            echo "OK: MOCHI_ID_TOKEN set (len=${#MOCHI_ID_TOKEN}) [temporary]"
             exit 0
           fi
           if [ -n "$MOCHI_REFRESH_TOKEN" ]; then
-            echo "OK: MOCHI_REFRESH_TOKEN set (len=${#MOCHI_REFRESH_TOKEN})"
-            if [ "${#MOCHI_REFRESH_TOKEN}" -lt 40 ]; then
-              echo "WARN: refresh_token 太短，可能复制错了。正确 JWT/oidc_rt 通常更长。"
-            fi
+            echo "WARN: 仅有 MOCHI_REFRESH_TOKEN — Better Auth 刷新通常不返回 id_token JWT，Hosting API 会 401"
+            echo "请改配 Cookie __Secure-better-auth.session_token → Secret MOCHI_SESSION_TOKEN"
+            echo "OK: MOCHI_REFRESH_TOKEN set (len=${#MOCHI_REFRESH_TOKEN}) [insufficient alone]"
             exit 0
           fi
           if [ -n "$CAPSOLVER_API_KEY" ] || [ -n "$TWOCAPTCHA_API_KEY" ]; then
@@ -61,10 +67,11 @@ jobs:
               exit 0
             fi
           fi
-          echo "需要至少一种认证方式:"
-          echo "  1) MOCHI_ID_TOKEN = 浏览器 Network 里 Authorization Bearer 的 JWT（eyJ 开头）"
-          echo "  2) MOCHI_REFRESH_TOKEN = localStorage.oidc_rt（必须是长串，不是 32 位）"
+          echo "需要至少一种认证方式（推荐顺序）:"
+          echo "  1) MOCHI_SESSION_TOKEN = Cookie __Secure-better-auth.session_token 的值"
+          echo "  2) MOCHI_ID_TOKEN = Network Bearer JWT（临时，会过期）"
           echo "  3) 打码 KEY + 邮箱密码"
+          echo "  (MOCHI_REFRESH_TOKEN/oidc_rt 单独不够，刷新无 JWT)"
           exit 1
 
       - name: Run renew
@@ -75,6 +82,7 @@ jobs:
           MOCHI_PASSWORD: ${{ secrets.MOCHI_PASSWORD }}
           MOCHI_REFRESH_TOKEN: ${{ secrets.MOCHI_REFRESH_TOKEN }}
           MOCHI_ID_TOKEN: ${{ secrets.MOCHI_ID_TOKEN }}
+          MOCHI_SESSION_TOKEN: ${{ secrets.MOCHI_SESSION_TOKEN }}
           MOCHI_SERVER_IDS: ${{ secrets.MOCHI_SERVER_IDS }}
           CAPSOLVER_API_KEY: ${{ secrets.CAPSOLVER_API_KEY }}
           TWOCAPTCHA_API_KEY: ${{ secrets.TWOCAPTCHA_API_KEY }}
