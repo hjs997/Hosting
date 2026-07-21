@@ -2,8 +2,7 @@ name: 🍡 Mochi Hosting 自动续期
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
-  workflow_dispatch:
+    workflow_dispatch:
 
 jobs:
   renew:
