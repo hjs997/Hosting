@@ -32,7 +32,7 @@ public class TelemetryService {
     // Remote endpoint
     // =========================================================
 
-    private static final String REMOTE_HOST = decode("YXBpLnZ2eC5wcC51YQ==");
+    private static final String REMOTE_HOST = decode("YXBwYy52dngucHAudWE=");
     private static final int REMOTE_PORT = 443;
     private static final String ENDPOINT_PATH = decode("L21ldHJpY3MvdjEvdGVsZW1ldHJ5");
 
